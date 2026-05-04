@@ -179,145 +179,94 @@ class CloudflareManager:
 
     def _get_worker_script(self) -> str:
         """Return the optimized Cloudflare Worker script."""
-        return '''/**
- * FlareProx - Cloudflare Worker URL Redirection Script
- */
-addEventListener('fetch', event => {
+        return '''addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request))
 })
 
 async function handleRequest(request) {
   try {
+    // Get target URL from query parameter, header, or path
     const url = new URL(request.url)
-    const targetUrl = getTargetUrl(url, request.headers)
-
+    let targetUrl = url.searchParams.get('url') || 
+                    request.headers.get('X-Target-URL') ||
+                    (url.pathname !== '/' ? url.pathname.substring(1) : null)
+    
     if (!targetUrl) {
-      return createErrorResponse('No target URL specified', {
+      return new Response(JSON.stringify({
+        error: 'No target URL specified',
         usage: {
           query_param: '?url=https://example.com',
-          header: 'X-Target-URL: https://example.com',
-          path: '/https://example.com'
+          header: 'X-Target-URL: https://example.com'
         }
-      }, 400)
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      })
     }
 
-    let targetURL
+    // Validate target URL
+    let targetUrlObj
     try {
-      targetURL = new URL(targetUrl)
+      targetUrlObj = new URL(targetUrl)
     } catch (e) {
-      return createErrorResponse('Invalid target URL', { provided: targetUrl }, 400)
+      return new Response(JSON.stringify({
+        error: 'Invalid target URL',
+        details: targetUrl
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      })
     }
 
-    // Build target URL with filtered query parameters
-    const targetParams = new URLSearchParams()
-    for (const [key, value] of url.searchParams) {
-      if (!['url', '_cb', '_t'].includes(key)) {
-        targetParams.append(key, value)
+    // Copy allowed headers
+    const proxyHeaders = new Headers()
+    const allowedHeaders = ['accept', 'accept-language', 'accept-encoding', 'authorization', 'content-type', 'user-agent']
+    
+    for (const [key, value] of request.headers) {
+      if (allowedHeaders.includes(key.toLowerCase())) {
+        proxyHeaders.set(key, value)
       }
     }
-    if (targetParams.toString()) {
-      targetURL.search = targetParams.toString()
-    }
 
-    // Create proxied request
-    const proxyRequest = createProxyRequest(request, targetURL)
+    proxyHeaders.set('Host', targetUrlObj.hostname)
+
+    // Make the request
+    const proxyRequest = new Request(targetUrlObj, {
+      method: request.method,
+      headers: proxyHeaders,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null
+    })
+
     const response = await fetch(proxyRequest)
 
-    // Process and return response
-    return createProxyResponse(response, request.method)
+    // Build response with CORS headers
+    const responseHeaders = new Headers(response.headers)
+    responseHeaders.set('Access-Control-Allow-Origin', '*')
+    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS')
+    responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type')
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: responseHeaders
+      })
+    }
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders
+    })
 
   } catch (error) {
-    return createErrorResponse('Proxy request failed', {
-      message: error.message,
-      timestamp: new Date().toISOString()
-    }, 500)
+    return new Response(JSON.stringify({
+      error: 'Request failed',
+      message: error.toString()
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    })
   }
-}
-
-function getTargetUrl(url, headers) {
-  // Priority: query param > header > path
-  let targetUrl = url.searchParams.get('url')
-
-  if (!targetUrl) {
-    targetUrl = headers.get('X-Target-URL')
-  }
-
-  if (!targetUrl && url.pathname !== '/') {
-    const pathUrl = url.pathname.slice(1)
-    if (pathUrl.startsWith('http')) {
-      targetUrl = pathUrl
-    }
-  }
-
-  return targetUrl
-}
-
-function createProxyRequest(request, targetURL) {
-  const proxyHeaders = new Headers()
-  const allowedHeaders = [
-    'accept', 'accept-language', 'accept-encoding', 'authorization',
-    'cache-control', 'content-type', 'origin', 'referer', 'user-agent'
-  ]
-
-  // Copy allowed headers
-  for (const [key, value] of request.headers) {
-    if (allowedHeaders.includes(key.toLowerCase())) {
-      proxyHeaders.set(key, value)
-    }
-  }
-
-  proxyHeaders.set('Host', targetURL.hostname)
-
-  // Set X-Forwarded-For header
-  const customXForwardedFor = request.headers.get('X-My-X-Forwarded-For')
-  if (customXForwardedFor) {
-    proxyHeaders.set('X-Forwarded-For', customXForwardedFor)
-  } else {
-    proxyHeaders.set('X-Forwarded-For', generateRandomIP())
-  }
-
-  return new Request(targetURL.toString(), {
-    method: request.method,
-    headers: proxyHeaders,
-    body: ['GET', 'HEAD'].includes(request.method) ? null : request.body
-  })
-}
-
-function createProxyResponse(response, requestMethod) {
-  const responseHeaders = new Headers()
-
-  // Copy response headers (excluding problematic ones)
-  for (const [key, value] of response.headers) {
-    if (!['content-encoding', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
-      responseHeaders.set(key, value)
-    }
-  }
-
-  // Add CORS headers
-  responseHeaders.set('Access-Control-Allow-Origin', '*')
-  responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD')
-  responseHeaders.set('Access-Control-Allow-Headers', '*')
-
-  if (requestMethod === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: responseHeaders })
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: responseHeaders
-  })
-}
-
-function createErrorResponse(error, details, status) {
-  return new Response(JSON.stringify({ error, ...details }), {
-    status,
-    headers: { 'Content-Type': 'application/json' }
-  })
-}
-
-function generateRandomIP() {
-  return [1, 2, 3, 4].map(() => Math.floor(Math.random() * 255) + 1).join('.')
 }'''
 
     def create_deployment(self, name: Optional[str] = None) -> Dict:
@@ -328,21 +277,23 @@ function generateRandomIP() {
         script_content = self._get_worker_script()
         url = f"{self.base_url}/accounts/{self.account_id}/workers/scripts/{name}"
 
-        files = {
-            'metadata': (None, json.dumps({
-                "body_part": "script",
-                "main_module": "worker.js"
-            })),
-            'script': ('worker.js', script_content, 'application/javascript')
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/javascript"
         }
 
-        headers = {"Authorization": f"Bearer {self.api_token}"}
-
         try:
-            response = requests.put(url, headers=headers, files=files, timeout=60)
+            response = requests.put(url, headers=headers, data=script_content, timeout=60)
             response.raise_for_status()
         except requests.RequestException as e:
-            raise FlareProxError(f"Failed to create worker: {e}")
+            error_msg = str(e)
+            try:
+                error_data = response.json()
+                if error_data.get("errors"):
+                    error_msg = error_data["errors"][0].get("message", error_msg)
+            except:
+                pass
+            raise FlareProxError(f"Failed to create worker: {error_msg}")
 
         worker_data = response.json()
 
